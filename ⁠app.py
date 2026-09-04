@@ -1,6 +1,8 @@
 import streamlit as st
 from datetime import datetime, timedelta
-import requests
+import asyncio
+from playwright.async_api import async_playwright
+import os
 
 st.set_page_config(page_title="SofaStreaks", page_icon="⚽", layout="wide")
 
@@ -8,12 +10,11 @@ st.markdown("""
 <style>
 .stButton>button { width: 100%; border-radius: 8px; height: 3em; background-color: #007AFF; color: white; }
 div[data-testid="stExpander"] { border-radius: 8px; }
-.streak-tag { background-color: #2c2c2e; padding: 4px 8px; border-radius: 6px; margin: 2px; display: inline-block; font-size: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("⚽ SofaScore Streaks Tracker")
-st.write("Scanare meciuri și serii statistice (Streaks)")
+st.write("Scanare meciuri și serii statistice în timp real")
 
 azi = datetime.now()
 optiuni_zile = {
@@ -25,55 +26,92 @@ optiuni_zile = {
 zi_selectata = st.selectbox("Alege ziua:", list(optiuni_zile.keys()))
 data_target = optiuni_zile[zi_selectata]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-}
-
-def obtine_meciuri(data_str):
-    url = f"https://api.sofascore.com/api/v1/sport/football/scheduled-events/{data_str}"
-    resp = requests.get(url, headers=HEADERS)
-    if resp.status_code == 200:
-        return resp.json().get("events", [])
-    return []
-
-def obtine_streaks_meci(event_id):
-    url = f"https://api.sofascore.com/api/v1/event/{event_id}/team-events-streaks"
-    resp = requests.get(url, headers=HEADERS)
-    if resp.status_code == 200:
-        data = resp.json()
-        streaks = []
-        # Preluăm seriile generale (general, home, away)
-        for category in ['general', 'home', 'away']:
-            for item in data.get(category, []):
-                name = item.get("name", "")
-                value = item.get("value", "")
-                if name:
-                    streaks.append(f"{name}: **{value}**")
-        return streaks
-    return []
+async def extrage_streaks_playwright(data_str):
+    os.system("playwright install chromium")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            viewport={'width': 390, 'height': 844}
+        )
+        page = await context.new_page()
+        
+        # Deschidem pagina principală pentru a stabili cookie-urile valide
+        await page.goto(f"https://www.sofascore.com/football/{data_str}", wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
+        
+        # Preluăm lista meciurilor prin fetch efectuat de browser
+        events_json = await page.evaluate(f"""
+            async () => {{
+                try {{
+                    const res = await fetch('https://api.sofascore.com/api/v1/sport/football/scheduled-events/{data_str}');
+                    return await res.json();
+                }} catch (e) {{
+                    return {{ events: [] }};
+                }}
+            }}
+        """)
+        
+        events = events_json.get("events", [])
+        meciuri_rezultat = []
+        
+        # Procesăm meciurile găsite
+        for ev in events[:15]:
+            match_id = ev.get("id")
+            gazda = ev.get("homeTeam", {}).get("name", "N/A")
+            oaspete = ev.get("awayTeam", {}).get("name", "N/A")
+            liga = ev.get("tournament", {}).get("name", "Competiție")
+            ora = datetime.fromtimestamp(ev.get("startTimestamp", 0)).strftime('%H:%M')
+            
+            # Preluăm seriile statistice pentru meciul curent
+            streaks_json = await page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const res = await fetch('https://api.sofascore.com/api/v1/event/{match_id}/team-events-streaks');
+                        return await res.json();
+                    }} catch (e) {{
+                        return {{}};
+                    }}
+                }}
+            """)
+            
+            lista_streaks = []
+            for category in ['general', 'home', 'away']:
+                for item in streaks_json.get(category, []):
+                    name = item.get("name", "")
+                    value = item.get("value", "")
+                    if name:
+                        lista_streaks.append(f"{name}: **{value}**")
+            
+            meciuri_rezultat.append({
+                "ora": ora,
+                "liga": liga,
+                "gazda": gazda,
+                "oaspete": oaspete,
+                "streaks": lista_streaks
+            })
+            
+        await browser.close()
+        return meciuri_rezultat
 
 if st.button("🔎 Caută Meciuri & Streaks"):
-    with st.spinner("Se analizează meciurile și seriile statistice..."):
-        events = obtine_meciuri(data_target)
-        if events:
-            st.success(f"Am găsit {len(events)} meciuri. Se procesează primele 15...")
-            
-            # Afișăm primele 15 meciuri cu seriile lor
-            for ev in events[:15]:
-                match_id = ev.get("id")
-                gazda = ev.get("homeTeam", {}).get("name", "N/A")
-                oaspete = ev.get("awayTeam", {}).get("name", "N/A")
-                liga = ev.get("tournament", {}).get("name", "Competiție")
-                ora = datetime.fromtimestamp(ev.get("startTimestamp", 0)).strftime('%H:%M')
-                
-                streaks = obtine_streaks_meci(match_id)
-                
-                with st.expander(f"⏰ {ora} | {liga} — {gazda} vs {oaspete}"):
-                    if streaks:
-                        st.write("🔥 **Serii statistice (Streaks):**")
-                        for s in streaks:
-                            st.markdown(f"- {s}")
-                    else:
-                        st.write("Nu există serii speciale raportate pentru acest meci.")
-        else:
-            st.warning("Nu s-au putut prelua meciurile pe această dată.")
+    with st.spinner("Se preiau meciurile și seriile statistice de pe SofaScore..."):
+        try:
+            meciuri = asyncio.run(extrage_streaks_playwright(data_target))
+            if meciuri:
+                st.success(f"Am găsit {len(meciuri)} meciuri!")
+                for m in meciuri:
+                    with st.expander(f"⏰ {m['ora']} | {m['liga']} — {m['gazda']} vs {m['oaspete']}"):
+                        if m['streaks']:
+                            st.write("🔥 **Serii statistice (Streaks):**")
+                            for s in m['streaks']:
+                                st.markdown(f"- {s}")
+                        else:
+                            st.write("Nu există serii speciale raportate pentru acest meci.")
+            else:
+                st.warning("Nu s-au putut prelua meciurile. Reîncearcă în câteva momente.")
+        except Exception as e:
+            st.error(f"Eroare întâmpinată: {e}")
